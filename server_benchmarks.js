@@ -8,8 +8,8 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const port = Number(process.env.PORT || 5544);
 
-// Point this at your built transparency.duckdb (the one build_benchmarks.py ran against).
-const databasePath = path.resolve(process.env.DUCKDB_PATH || path.join(__dirname, 'transparency.duckdb'));
+// Default to the sibling TiC database; DUCKDB_PATH can point at another build.
+const databasePath = path.resolve(process.env.DUCKDB_PATH || path.join(__dirname, '..', 'TiC', 'transparency.duckdb'));
 
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(__dirname));
@@ -128,6 +128,78 @@ app.get('/api/benchmark/counties', async (req, res) => {
       WHERE billing_code = ${sqlLit(code)} AND billing_code_type = ${sqlLit(type)}
         AND provider_state = ${sqlLit(state)}
       ORDER BY rate_median DESC
+    `);
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Code-level payer rollup. This includes providers whose NPI is not yet
+// present in the enrichment database, unlike the county-specific endpoint.
+app.get('/api/benchmark/payers', async (req, res) => {
+  const code = cleanToken(req.query.code);
+  const type = cleanToken(req.query.type);
+  if (!code || !type) return res.status(400).json({ error: 'code and type are required.' });
+  try {
+    const rows = await execute(`
+      SELECT
+        payer_name AS payer, n_rates, n_providers, n_states,
+        rate_min, rate_p25, rate_median, rate_p75, rate_max, rate_avg
+      FROM benchmarks_payer_stats
+      WHERE billing_code = ${sqlLit(code)} AND billing_code_type = ${sqlLit(type)}
+      ORDER BY rate_median DESC, payer
+    `);
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Payer rollup for every county in one state. This keeps payer comparisons at
+// the same geography and code grain as the existing county table.
+app.get('/api/benchmark/payer-counties', async (req, res) => {
+  const code = cleanToken(req.query.code);
+  const type = cleanToken(req.query.type);
+  const state = cleanToken(req.query.state, 4);
+  if (!code || !type || !state) return res.status(400).json({ error: 'code, type and state are required.' });
+  try {
+    const rows = await execute(`
+      SELECT
+        payer_name AS payer, county_name, county_fips,
+        n_rates, n_providers, rate_min, rate_p25, rate_median, rate_p75, rate_max, rate_avg
+      FROM benchmarks_geo_payer_stats
+      WHERE billing_code = ${sqlLit(code)} AND billing_code_type = ${sqlLit(type)}
+        AND provider_state = ${sqlLit(state)}
+      ORDER BY county_name, rate_median DESC
+    `);
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Provider-level values for one payer and county. County is optional so this
+// can also be used to inspect all providers in a state.
+app.get('/api/benchmark/providers', async (req, res) => {
+  const code = cleanToken(req.query.code);
+  const type = cleanToken(req.query.type);
+  const payer = String(req.query.payer ?? '').trim().slice(0, 200);
+  const state = cleanToken(req.query.state, 4);
+  const county = String(req.query.county ?? '').trim().slice(0, 32);
+  if (!code || !type || !payer || !state) return res.status(400).json({ error: 'code, type, payer and state are required.' });
+  try {
+    const countyFilter = county ? ` AND county_fips = ${sqlLit(county)}` : '';
+    const rows = await execute(`
+      SELECT
+        npi, provider_name, provider_city, provider_state, provider_zip5,
+        county_name, county_fips, n_rates, rate_min, rate_median, rate_max, rate_avg
+      FROM benchmarks_payer_provider_stats
+      WHERE billing_code = ${sqlLit(code)} AND billing_code_type = ${sqlLit(type)}
+        AND payer_name = ${sqlLit(payer)} AND provider_state = ${sqlLit(state)}
+        ${countyFilter}
+      ORDER BY rate_median DESC, provider_name
+      LIMIT 500
     `);
     res.json(rows);
   } catch (error) {

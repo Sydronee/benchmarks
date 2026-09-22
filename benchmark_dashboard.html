@@ -74,6 +74,9 @@ tbody td:first-child{color:var(--ink)}
 
 #countyBlock{display:none}
 #countyBlock h2 .st{color:var(--accent)}
+#payerBlock,#providerBlock{display:none}
+#payerBlock h2 .st,#providerBlock h2 .payer{color:var(--accent)}
+#payerSummaryBlock{display:none}
 
 .empty{color:var(--ink-faint);font-size:13px;padding:20px 0;text-align:center;border:1px dashed var(--line)}
 </style>
@@ -124,6 +127,42 @@ tbody td:first-child{color:var(--ink)}
         <tbody id="countyBody"></tbody>
       </table>
     </section>
+
+    <section id="payerSummaryBlock">
+      <h2>By payer</h2>
+      <div class="sub">all available rates for this code; geography is shown separately when enriched</div>
+      <table>
+        <thead><tr>
+          <th>Payer</th><th>States</th><th>Providers</th><th>Rates</th>
+          <th>P25</th><th>Median</th><th>P75</th><th>Max</th>
+        </tr></thead>
+        <tbody id="payerSummaryBody"></tbody>
+      </table>
+    </section>
+
+    <section id="payerBlock">
+      <h2>Compare payers &mdash; <span class="st" id="payerState"></span></h2>
+      <div class="sub">same code and county, separated by reporting entity; select a row for provider values</div>
+      <table>
+        <thead><tr>
+          <th>Payer</th><th>County</th><th>Providers</th><th>Rates</th>
+          <th>P25</th><th>Median</th><th>P75</th><th>Max</th>
+        </tr></thead>
+        <tbody id="payerBody"></tbody>
+      </table>
+    </section>
+
+    <section id="providerBlock">
+      <h2>Provider values &mdash; <span class="payer" id="providerPayer"></span></h2>
+      <div class="sub" id="providerCounty"></div>
+      <table>
+        <thead><tr>
+          <th>Provider</th><th>NPI</th><th>City</th><th>Rates</th>
+          <th>Min</th><th>Median</th><th>Avg</th><th>Max</th>
+        </tr></thead>
+        <tbody id="providerBody"></tbody>
+      </table>
+    </section>
   </div>
 </div>
 
@@ -165,12 +204,16 @@ async function runSearch() {
   $('#goBtn').disabled = true;
   $('#results').style.display = 'none';
   $('#countyBlock').style.display = 'none';
+  $('#payerSummaryBlock').style.display = 'none';
+  $('#payerBlock').style.display = 'none';
+  $('#providerBlock').style.display = 'none';
   setStatus(`Looking up ${type} ${code}...`);
 
   try {
-    const [summary, states] = await Promise.all([
+    const [summary, states, payers] = await Promise.all([
       getJSON(`/api/benchmark/summary?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}`),
-      getJSON(`/api/benchmark/states?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}`)
+      getJSON(`/api/benchmark/states?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}`),
+      getJSON(`/api/benchmark/payers?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}`)
     ]);
 
     if (!summary) {
@@ -180,6 +223,7 @@ async function runSearch() {
 
     setStatus('');
     renderSummary(summary);
+    renderPayerSummary(payers);
     renderStates(states, code, type);
     $('#results').style.display = 'block';
   } catch (e) {
@@ -187,6 +231,15 @@ async function runSearch() {
   } finally {
     $('#goBtn').disabled = false;
   }
+}
+
+function renderPayerSummary(rows) {
+  $('#payerSummaryBlock').style.display = 'block';
+  $('#payerSummaryBody').innerHTML = rows.length ? rows.map(r => `
+    <tr>
+      <td>${esc(r.payer || '-')}</td><td>${int(r.n_states)}</td><td>${int(r.n_providers)}</td><td>${int(r.n_rates)}</td>
+      <td>${usd(r.rate_p25)}</td><td>${usd(r.rate_median)}</td><td>${usd(r.rate_p75)}</td><td>${usd(r.rate_max)}</td>
+    </tr>`).join('') : `<tr><td colspan="8"><div class="empty">No payer-level rates for this code.</div></td></tr>`;
 }
 
 function renderSummary(s) {
@@ -253,8 +306,51 @@ async function loadCounties(code, type, state) {
         <td>${esc(r.county_name || r.county_fips || '-')}</td><td>${int(r.n_providers)}</td><td>${int(r.n_payers)}</td><td>${int(r.n_rates)}</td>
         <td>${usd(r.rate_p25)}</td><td>${usd(r.rate_median)}</td><td>${usd(r.rate_p75)}</td><td>${usd(r.rate_max)}</td>
       </tr>`).join('') : `<tr><td colspan="8"><div class="empty">No county-level rates for ${esc(state)}.</div></td></tr>`;
+    loadPayerCounties(code, type, state);
   } catch (e) {
     $('#countyBody').innerHTML = `<tr><td colspan="8"><div class="empty">${esc(e.message)}</div></td></tr>`;
+  }
+}
+
+async function loadPayerCounties(code, type, state) {
+  $('#payerState').textContent = state;
+  $('#payerBlock').style.display = 'block';
+  $('#providerBlock').style.display = 'none';
+  try {
+    const rows = await getJSON(`/api/benchmark/payer-counties?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}&state=${encodeURIComponent(state)}`);
+    $('#payerBody').innerHTML = rows.length ? rows.map((r, index) => `
+      <tr data-payer="${esc(r.payer)}" data-county="${esc(r.county_fips || '')}" data-county-name="${esc(r.county_name || r.county_fips || '')}">
+        <td>${esc(r.payer || '-')}</td><td>${esc(r.county_name || r.county_fips || '-')}</td>
+        <td>${int(r.n_providers)}</td><td>${int(r.n_rates)}</td>
+        <td>${usd(r.rate_p25)}</td><td>${usd(r.rate_median)}</td><td>${usd(r.rate_p75)}</td><td>${usd(r.rate_max)}</td>
+      </tr>`).join('') : `<tr><td colspan="8"><div class="empty">No payer-level county data for ${esc(state)}.</div></td></tr>`;
+
+    $('#payerBody').querySelectorAll('tr[data-payer]').forEach(tr => {
+      tr.addEventListener('click', () => {
+        $('#payerBody').querySelectorAll('tr').forEach(t => t.classList.remove('active'));
+        tr.classList.add('active');
+        loadProviders(code, type, state, tr.dataset.payer, tr.dataset.county, tr.dataset.countyName);
+      });
+    });
+  } catch (e) {
+    $('#payerBody').innerHTML = `<tr><td colspan="8"><div class="empty">${esc(e.message)}</div></td></tr>`;
+  }
+}
+
+async function loadProviders(code, type, state, payer, county, countyName) {
+  $('#providerPayer').textContent = payer;
+  $('#providerCounty').textContent = `${countyName} (${state})`;
+  $('#providerBlock').style.display = 'block';
+  try {
+    const url = `/api/benchmark/providers?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}&state=${encodeURIComponent(state)}&payer=${encodeURIComponent(payer)}&county=${encodeURIComponent(county)}`;
+    const rows = await getJSON(url);
+    $('#providerBody').innerHTML = rows.length ? rows.map(r => `
+      <tr>
+        <td>${esc(r.provider_name || '-')}</td><td>${esc(r.npi || '-')}</td><td>${esc(r.provider_city || '-')}</td>
+        <td>${int(r.n_rates)}</td><td>${usd(r.rate_min)}</td><td>${usd(r.rate_median)}</td><td>${usd(r.rate_avg)}</td><td>${usd(r.rate_max)}</td>
+      </tr>`).join('') : `<tr><td colspan="8"><div class="empty">No provider-level values for this payer and county.</div></td></tr>`;
+  } catch (e) {
+    $('#providerBody').innerHTML = `<tr><td colspan="8"><div class="empty">${esc(e.message)}</div></td></tr>`;
   }
 }
 
