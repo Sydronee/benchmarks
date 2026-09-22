@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rate Benchmarks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root{
+  --ink: #e7e4dc; --ink-dim: #9b968a; --ink-faint: #6a6659;
+  --bg: #15140f; --bg2: #1b1a14; --line: #33312a;
+  --accent: #c98a3a; --accent-soft: #c98a3a26;
+  --good: #7fae6f; --bad: #c96a4f;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font-family:'IBM Plex Mono',monospace}
+h1,h2,.serif{font-family:'Source Serif 4',serif}
+
+.wrap{max-width:1040px;margin:0 auto;padding:48px 24px 80px}
+
+header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:36px;border-bottom:1px solid var(--line);padding-bottom:20px}
+header h1{font-size:26px;font-weight:600;margin:0;letter-spacing:-.01em}
+header .tag{color:var(--ink-faint);font-size:12px;margin-top:4px}
+
+.search{display:flex;gap:10px;margin-bottom:8px}
+.search input, .search select{
+  background:var(--bg2);border:1px solid var(--line);color:var(--ink);
+  border-radius:3px;padding:11px 13px;font-family:inherit;font-size:14px;
+}
+.search input{flex:1;min-width:0}
+.search input::placeholder{color:var(--ink-faint)}
+.search input:focus, .search select:focus{outline:none;border-color:var(--accent)}
+.search select{width:120px}
+.search button{
+  background:var(--accent);border:none;color:#1b1508;font-weight:600;
+  padding:11px 20px;border-radius:3px;cursor:pointer;font-family:inherit;font-size:14px;
+}
+.search button:hover{filter:brightness(1.08)}
+.search button:disabled{opacity:.5;cursor:default}
+.hint{color:var(--ink-faint);font-size:12px;margin-bottom:36px}
+
+#status{font-size:13px;color:var(--ink-faint);margin:16px 0}
+#status.err{color:var(--bad)}
+
+#results{display:none}
+
+.desc{font-size:15px;color:var(--ink-dim);margin-bottom:28px;line-height:1.5}
+.desc b{color:var(--ink);font-weight:600}
+
+.kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-bottom:40px}
+.kpi{background:var(--bg);padding:16px 14px}
+.kpi .v{font-size:20px;font-weight:500;color:var(--ink)}
+.kpi .l{font-size:10.5px;color:var(--ink-faint);margin-top:4px;letter-spacing:.03em}
+
+section{margin-bottom:44px}
+section > h2{font-size:16px;font-weight:600;margin:0 0 4px}
+section > .sub{font-size:12px;color:var(--ink-faint);margin-bottom:16px}
+
+#chartHost{height:220px;margin-bottom:20px}
+
+table{width:100%;border-collapse:collapse;font-size:13px}
+thead th{
+  text-align:right;font-weight:500;color:var(--ink-faint);font-size:11px;
+  padding:7px 10px;border-bottom:1px solid var(--line);letter-spacing:.02em;white-space:nowrap;
+}
+thead th:first-child, td:first-child{text-align:left}
+tbody td{padding:8px 10px;border-bottom:1px solid #232119;text-align:right;white-space:nowrap;color:var(--ink-dim)}
+tbody tr:hover{background:var(--accent-soft);cursor:pointer}
+tbody tr.active{background:var(--accent-soft);color:var(--ink)}
+tbody td:first-child{color:var(--ink)}
+
+#countyBlock{display:none}
+#countyBlock h2 .st{color:var(--accent)}
+
+.empty{color:var(--ink-faint);font-size:13px;padding:20px 0;text-align:center;border:1px dashed var(--line)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Rate Benchmarks</h1>
+      <div class="tag">negotiated rate comparisons by state &amp; county</div>
+    </div>
+  </header>
+
+  <div class="search">
+    <input id="codeInput" type="text" placeholder="Billing code, e.g. 99213" autocomplete="off">
+    <select id="typeInput"></select>
+    <button id="goBtn">Compare</button>
+  </div>
+  <div class="hint">Enter a CPT, HCPCS, or RC code to see how negotiated rates vary by state and county.</div>
+
+  <div id="status"></div>
+
+  <div id="results">
+    <div class="desc" id="descline"></div>
+    <div class="kpis" id="kpis"></div>
+
+    <section>
+      <h2>By state</h2>
+      <div class="sub">median negotiated rate, high to low</div>
+      <div id="chartHost"><canvas id="stateChart"></canvas></div>
+      <table>
+        <thead><tr>
+          <th>State</th><th>Counties</th><th>Providers</th><th>Rates</th>
+          <th>Min</th><th>Median</th><th>Avg</th><th>Max</th>
+        </tr></thead>
+        <tbody id="stateBody"></tbody>
+      </table>
+    </section>
+
+    <section id="countyBlock">
+      <h2>By county &mdash; <span class="st" id="countyState"></span></h2>
+      <div class="sub">median negotiated rate, high to low</div>
+      <table>
+        <thead><tr>
+          <th>County</th><th>Providers</th><th>Payers</th><th>Rates</th>
+          <th>P25</th><th>Median</th><th>P75</th><th>Max</th>
+        </tr></thead>
+        <tbody id="countyBody"></tbody>
+      </table>
+    </section>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let stateChart = null;
+
+const usd = n => n == null ? '-' : '$' + Number(n).toLocaleString(undefined, {maximumFractionDigits: 2});
+const int = n => n == null ? '-' : Number(n).toLocaleString();
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function getJSON(url) {
+  const r = await fetch(url);
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  return body;
+}
+
+async function loadCodeTypes() {
+  try {
+    const types = await getJSON('/api/code-types');
+    $('#typeInput').innerHTML = types.map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join('');
+  } catch (e) {
+    $('#typeInput').innerHTML = ['CPT', 'HCPCS', 'RC', 'MS-DRG', 'NDC'].map(t => `<option>${t}</option>`).join('');
+  }
+}
+
+function setStatus(msg, isErr) {
+  const el = $('#status');
+  el.textContent = msg || '';
+  el.className = isErr ? 'err' : '';
+}
+
+async function runSearch() {
+  const code = $('#codeInput').value.trim();
+  const type = $('#typeInput').value;
+  if (!code) { setStatus('Enter a billing code first.', true); return; }
+
+  $('#goBtn').disabled = true;
+  $('#results').style.display = 'none';
+  $('#countyBlock').style.display = 'none';
+  setStatus(`Looking up ${type} ${code}...`);
+
+  try {
+    const [summary, states] = await Promise.all([
+      getJSON(`/api/benchmark/summary?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}`),
+      getJSON(`/api/benchmark/states?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}`)
+    ]);
+
+    if (!summary) {
+      setStatus(`No rates found for ${type} ${code}.`, true);
+      return;
+    }
+
+    setStatus('');
+    renderSummary(summary);
+    renderStates(states, code, type);
+    $('#results').style.display = 'block';
+  } catch (e) {
+    setStatus('Error: ' + e.message, true);
+  } finally {
+    $('#goBtn').disabled = false;
+  }
+}
+
+function renderSummary(s) {
+  $('#descline').innerHTML = `<b>${esc(s.billing_code_type)} ${esc(s.billing_code)}</b> &mdash; ${esc(s.code_description || 'no description on file')}`;
+  $('#kpis').innerHTML = [
+    ['Negotiated rates', int(s.n_rates)],
+    ['Providers', int(s.n_providers)],
+    ['Payers', int(s.n_payers)],
+    ['Counties', int(s.n_counties)],
+    ['Median rate', usd(s.rate_median)],
+  ].map(([l,v]) => `<div class="kpi"><div class="v">${v}</div><div class="l">${esc(l)}</div></div>`).join('');
+}
+
+function renderStates(rows, code, type) {
+  $('#stateBody').innerHTML = rows.length ? rows.map(r => `
+    <tr data-state="${esc(r.state)}">
+      <td>${esc(r.state)}</td><td>${int(r.n_counties)}</td><td>${int(r.n_providers)}</td><td>${int(r.n_rates)}</td>
+      <td>${usd(r.rate_min)}</td><td>${usd(r.rate_median)}</td><td>${usd(r.rate_avg)}</td><td>${usd(r.rate_max)}</td>
+    </tr>`).join('') : `<tr><td colspan="8"><div class="empty">No geo-tagged rates for this code.</div></td></tr>`;
+
+  $('#stateBody').querySelectorAll('tr[data-state]').forEach(tr => {
+    tr.addEventListener('click', () => {
+      $('#stateBody').querySelectorAll('tr').forEach(t => t.classList.remove('active'));
+      tr.classList.add('active');
+      loadCounties(code, type, tr.dataset.state);
+    });
+  });
+
+  const top = rows.slice(0, 15);
+  const ctx = $('#stateChart').getContext('2d');
+  if (stateChart) stateChart.destroy();
+  stateChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: top.map(r => r.state),
+      datasets: [{
+        data: top.map(r => r.rate_median),
+        backgroundColor: '#c98a3a',
+        borderRadius: 2,
+        barThickness: 16
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => usd(c.raw) } } },
+      scales: {
+        x: { ticks: { color: '#9b968a', font: { family: 'IBM Plex Mono', size: 11 } }, grid: { display: false } },
+        y: { ticks: { color: '#9b968a', font: { family: 'IBM Plex Mono', size: 11 }, callback: v => '$' + v }, grid: { color: '#232119' } }
+      }
+    }
+  });
+
+  if (rows.length) loadCounties(code, type, rows[0].state, rows[0]);
+}
+
+async function loadCounties(code, type, state) {
+  $('#countyState').textContent = state;
+  $('#countyBlock').style.display = 'block';
+  $('#stateBody').querySelectorAll('tr').forEach(t => t.classList.toggle('active', t.dataset.state === state));
+  try {
+    const rows = await getJSON(`/api/benchmark/counties?code=${encodeURIComponent(code)}&type=${encodeURIComponent(type)}&state=${encodeURIComponent(state)}`);
+    $('#countyBody').innerHTML = rows.length ? rows.map(r => `
+      <tr>
+        <td>${esc(r.county_name || r.county_fips || '-')}</td><td>${int(r.n_providers)}</td><td>${int(r.n_payers)}</td><td>${int(r.n_rates)}</td>
+        <td>${usd(r.rate_p25)}</td><td>${usd(r.rate_median)}</td><td>${usd(r.rate_p75)}</td><td>${usd(r.rate_max)}</td>
+      </tr>`).join('') : `<tr><td colspan="8"><div class="empty">No county-level rates for ${esc(state)}.</div></td></tr>`;
+  } catch (e) {
+    $('#countyBody').innerHTML = `<tr><td colspan="8"><div class="empty">${esc(e.message)}</div></td></tr>`;
+  }
+}
+
+$('#goBtn').addEventListener('click', runSearch);
+$('#codeInput').addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
+
+loadCodeTypes();
+</script>
+</body>
+</html>
