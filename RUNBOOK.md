@@ -116,11 +116,36 @@ Run this after ingestion or enrichment changes:
 ```bash
 cd /home/syd/Documents/GitHub/TiC
 
-python build_benchmarks.py \
-  --transparency-db transparency.duckdb \
-  --enrichment-db enrichment.duckdb \
-  --drop-first
+python build_benchmarks.py --transparency-db transparency.duckdb --enrichment-db enrichment.duckdb --drop-first
 ```
+
+The build materializes a second copy of the rates, creates six indexes, and
+computes several percentile-heavy aggregate tables. Its working footprint can
+therefore be several times larger than the source database, especially when
+DuckDB is recovering an interrupted transaction. Put temporary files on a
+volume with enough free space and, for a lower-memory initial build, use:
+
+```bash
+mkdir -p /path/to/duckdb-temp
+
+python build_benchmarks.py --transparency-db cigna.duckdb --enrichment-db enrichment.duckdb --drop-first --skip-indexes --skip-stats --threads 4 --temp-directory /path/to/duckdb-temp
+```
+
+Build the statistics separately:
+
+```bash
+python build_benchmarks.py --transparency-db cigna.duckdb --enrichment-db enrichment.duckdb --stats-only --threads 4 --temp-directory /path/to/duckdb-temp
+```
+
+After an interrupted run, first ensure no process is still using the database,
+then consolidate recovery data before rebuilding:
+
+```bash
+python -c "import duckdb; con = duckdb.connect('cigna.duckdb'); con.execute('CHECKPOINT'); con.close()"
+```
+
+Use `--drop-first` when rebuilding. Without it, `CREATE TABLE IF NOT EXISTS
+benchmarks` can leave an old benchmark table untouched.
 
 This creates the base `benchmarks` table and the comparison rollups,
 including:
