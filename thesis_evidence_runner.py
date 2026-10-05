@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-SCRIPT_VERSION = "1.1"
+SCRIPT_VERSION = "1.2"
 
 
 @dataclass
@@ -552,7 +552,6 @@ def test_ingestion(results, root: Path, fixtures: dict[str, Path], repo: Path):
             stream_parser.process_file(con, str(fixtures["second"]), "fixture-second.json")
         finally:
             con.close()
-        import duckdb
         con = duckdb.connect(str(db), read_only=True)
         try:
             syn = int(con.execute("SELECT COUNT(DISTINCT provider_reference_id) FROM providers WHERE provider_reference_id < 0").fetchone()[0])
@@ -897,12 +896,13 @@ def test_benchmarks(results, root: Path, repo: Path):
               "4 qualifying rows remain", tc22)
 
     def tc23():
-        tables = show_tables(root / "benchmark_exact.duckdb")
+        db = run_benchmark_case(root, repo, approx=False, skip_indexes=False, skip_stats=False)
+        tables = show_tables(db)
         stats = {t for t in tables if t.startswith("benchmarks_") and t.endswith("stats")}
         expected = {"benchmarks_code_stats", "benchmarks_geo_stats", "benchmarks_geo_payer_stats",
                     "benchmarks_payer_stats", "benchmarks_payer_provider_stats", "benchmarks_provider_stats"}
         return expect("benchmarks" in tables and stats == expected,
-                      f"benchmark_tables={tables}")
+                      f"benchmark_tables={tables}; benchmark_stat_tables={sorted(stats)}")
     call_case(results, "TC-23", "Benchmark", "Base benchmark and six statistical tables are created",
               "benchmarks + six benchmarks_*_stats tables", tc23)
 
@@ -1021,7 +1021,17 @@ def test_validation(results, root: Path, repo: Path):
         import duckdb
         c = duckdb.connect(str(db))
         try:
-            c.execute("INSERT INTO negotiated_rates SELECT 999999, code_id, negotiation_arrangement, billing_class, setting, negotiated_type, negotiated_rate, service_code, billing_code_modifier, expiration_date, provider_reference_ids, source_file FROM negotiated_rates LIMIT 1")
+            c.execute("""
+                INSERT INTO negotiated_rates (
+                    payer_id, code_id, negotiation_arrangement, billing_class, setting,
+                    negotiated_type, negotiated_rate, service_code, billing_code_modifier,
+                    expiration_date, provider_reference_ids, source_file
+                )
+                SELECT 999999, code_id, negotiation_arrangement, billing_class, setting,
+                       negotiated_type, negotiated_rate, service_code, billing_code_modifier,
+                       expiration_date, provider_reference_ids, source_file
+                FROM negotiated_rates LIMIT 1
+            """)
             c.execute("CHECKPOINT")
         finally:
             c.close()
@@ -1059,10 +1069,22 @@ def test_validation(results, root: Path, repo: Path):
             # Two zero dollar rates -> error; two outliers -> warnings; three invalid NPIs -> warning.
             rows = c.execute("SELECT payer_id, code_id, negotiation_arrangement, billing_class, setting, expiration_date, provider_reference_ids, source_file FROM negotiated_rates LIMIT 1").fetchone()
             for rate in (0.0, -1.0):
-                c.execute("INSERT INTO negotiated_rates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                c.execute("""
+                    INSERT INTO negotiated_rates (
+                        payer_id, code_id, negotiation_arrangement, billing_class, setting,
+                        negotiated_type, negotiated_rate, service_code, billing_code_modifier,
+                        expiration_date, provider_reference_ids, source_file
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
                           (rows[0], rows[1], rows[2], rows[3], rows[4], "negotiated", rate, [], [], rows[5], rows[6], rows[7]))
             for rate in (300000.0, 500000.0):
-                c.execute("INSERT INTO negotiated_rates VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                c.execute("""
+                    INSERT INTO negotiated_rates (
+                        payer_id, code_id, negotiation_arrangement, billing_class, setting,
+                        negotiated_type, negotiated_rate, service_code, billing_code_modifier,
+                        expiration_date, provider_reference_ids, source_file
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
                           (rows[0], rows[1], rows[2], rows[3], rows[4], "negotiated", rate, [], [], rows[5], rows[6], rows[7]))
             for idx, npi in enumerate([NPI_BAD, NPI_BAD + 2, 3000000000], start=1):
                 c.execute("INSERT INTO providers (provider_reference_id, npi, tin_type, tin_value, facility_name, network_name, group_key) VALUES (?,?,?,?,?,?,?)",
@@ -1332,6 +1354,7 @@ def write_reports(results: list[TestResult], out: Path, snapshot: dict[str, Any]
     md.append("")
     md.append(f"Generated: `{data['generated_utc']}`")
     md.append(f"Repository: `{repo}`")
+    md.append(f"Runner version: `{SCRIPT_VERSION}`")
     md.append("")
     md.append("## Summary")
     md.append("")
