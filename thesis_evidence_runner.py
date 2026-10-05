@@ -1,136 +1,361 @@
 #!/usr/bin/env python3
+
 """
-Targeted rerun of the remaining local TiC/Cigna thesis cases.
+TiC / Cigna standalone thesis evidence rerunner
 
-Runs ONLY local tests:
-  TC-19, TC-20, TC-21, TC-23, TC-27, TC-29, TC-30, TC-31, TC-32, TC-33.
+Runs only the previously failed local test cases:
+    TC-10
+    TC-19
+    TC-20
+    TC-21
+    TC-23
+    TC-27
+    TC-29
+    TC-30
+    TC-31
+    TC-32
+    TC-33
 
-It does NOT start or call the benchmark API.
-It does NOT modify transparency.duckdb or enrichment.duckdb.
-It uses isolated temporary fixtures and the repository's own modules.
+No API server is required.
 
-Place this beside thesis_evidence_runner_cigna_v1_2.py in the TiC repo root,
-then run:
+Run from the TiC repository root:
 
-    python thesis_targeted_cigna_rerun.py
+    python .\thesis_evidence_runner_cigna_standalone.py
 """
 
 from __future__ import annotations
 
 import json
+import gzip
+import hashlib
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
+import urllib.parse
+import zipfile
 from dataclasses import dataclass, asdict
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
+# ============================================================
+# TEST RESULT
+# ============================================================
 
 @dataclass
-class Result:
+class TestResult:
     case: str
+    area: str
     status: str
     actual: str
-    note: str = ""
+    elapsed_ms: float
+    notes: str = ""
 
 
-def load_previous_runner(repo: Path):
-    """Import helper functions/constants from the repository-specific v1.2 runner."""
-    path = repo / "thesis_evidence_runner_cigna_v1_2.py"
+# ============================================================
+# NPI HELPERS
+# ============================================================
 
-    if not path.exists():
-        raise FileNotFoundError(
-            "Missing thesis_evidence_runner_cigna_v1_2.py. "
-            "Put this script in the same TiC folder as v1.2."
-        )
+def valid_npi(prefix9: str) -> int:
+    s = str(prefix9)
 
-    import importlib.util
+    if len(s) != 9 or not s.isdigit():
+        raise ValueError("prefix9 must contain exactly 9 digits")
 
-    spec = importlib.util.spec_from_file_location(
-        "tic_prev_runner",
-        path
+    payload = "80840" + s
+
+    total = 0
+
+    for i, ch in enumerate(reversed(payload)):
+        d = int(ch)
+
+        if i % 2 == 0:
+            d *= 2
+
+            if d > 9:
+                d -= 9
+
+        total += d
+
+    check_digit = (10 - (total % 10)) % 10
+
+    return int(s + str(check_digit))
+
+
+NPI_ORG = valid_npi("222222222")
+NPI_INDIV = valid_npi("123456789")
+NPI_ORG_2 = valid_npi("211111111")
+
+NPI_BAD = NPI_ORG + 1
+
+
+# ============================================================
+# REPOSITORY DISCOVERY
+# ============================================================
+
+def find_repo() -> Path:
+    here = Path.cwd().resolve()
+
+    candidates = [
+        here,
+        here / "TiC",
+        here / "tic-cigna",
+        here.parent,
+    ]
+
+    for candidate in candidates:
+        if (
+            (candidate / "schema.sql").exists()
+            and (candidate / "stream_parser.py").exists()
+        ):
+            return candidate.resolve()
+
+    raise FileNotFoundError(
+        "Could not find the TiC repository.\n"
+        "Run this script from the TiC repository folder."
     )
 
-    if spec is None or spec.loader is None:
-        raise RuntimeError(
-            "Could not load thesis_evidence_runner_cigna_v1_2.py"
-        )
 
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+# ============================================================
+# SYNTHETIC MRF
+# ============================================================
 
-    return mod
+def synthetic_mrf(plan_id="SYNTH-01"):
+    embedded_provider = {
+        "npi": [valid_npi("199999999")],
+        "tin": {
+            "type": "ein",
+            "value": "12-3456789"
+        },
+        "business_name": "Embedded Facility"
+    }
+
+    return {
+        "reporting_entity_name": "Synthetic Cigna Test Payer",
+        "reporting_entity_type": "health insurance issuer",
+        "plan_name": "Synthetic Institutional Plan",
+        "plan_id": plan_id,
+        "plan_id_type": "HIOS",
+        "plan_market_type": "group",
+        "last_updated_on": "2026-09-01",
+        "version": "1",
+
+        "provider_references": [
+            {
+                "provider_group_id": 101,
+                "network_name": ["Synthetic Network"],
+                "provider_groups": [
+                    {
+                        "npi": [
+                            NPI_ORG,
+                            NPI_INDIV
+                        ],
+                        "tin": {
+                            "type": "ein",
+                            "value": "12-3456789"
+                        },
+                        "business_name": "Organization Facility"
+                    }
+                ]
+            },
+            {
+                "provider_group_id": 102,
+                "network_name": ["Synthetic Network 2"],
+                "provider_groups": [
+                    {
+                        "npi": [NPI_ORG_2],
+                        "tin": {
+                            "type": "ein",
+                            "value": "98-7654321"
+                        },
+                        "business_name": "Second Facility"
+                    }
+                ]
+            }
+        ],
+
+        "in_network": [
+            {
+                "negotiation_arrangement": "ffs",
+                "billing_code": "99213",
+                "billing_code_type": "CPT",
+                "billing_code_type_version": "2026",
+                "description": "MRF Office Visit",
+                "name": "Office Visit",
+
+                "negotiated_rates": [
+                    {
+                        "provider_references": [101],
+
+                        "negotiated_prices": [
+                            {
+                                "negotiated_type": "negotiated",
+                                "negotiated_rate": 100.0,
+                                "billing_class": "institutional",
+                                "setting": "outpatient",
+                                "service_code": ["11"],
+                                "billing_code_modifier": [],
+                                "expiration_date": "2026-12-31"
+                            },
+                            {
+                                "negotiated_type": "negotiated",
+                                "negotiated_rate": 999.0,
+                                "billing_class": "professional",
+                                "setting": "outpatient",
+                                "service_code": ["11"],
+                                "billing_code_modifier": [],
+                                "expiration_date": "2026-12-31"
+                            }
+                        ]
+                    },
+
+                    {
+                        "provider_groups": [embedded_provider],
+
+                        "negotiated_prices": [
+                            {
+                                "negotiated_type": "negotiated",
+                                "negotiated_rate": 125.0,
+                                "billing_class": "institutional",
+                                "setting": "outpatient",
+                                "service_code": ["11"],
+                                "billing_code_modifier": [],
+                                "expiration_date": "2026-12-31"
+                            }
+                        ]
+                    }
+                ]
+            },
+
+            {
+                "negotiation_arrangement": "ffs",
+                "billing_code": "470",
+                "billing_code_type": "MS-DRG",
+                "billing_code_type_version": "2026",
+                "description": "MRF DRG",
+                "name": "DRG 470",
+
+                "negotiated_rates": [
+                    {
+                        "provider_references": [101],
+
+                        "negotiated_prices": [
+                            {
+                                "negotiated_type": "negotiated",
+                                "negotiated_rate": 500.0,
+                                "billing_class": "institutional",
+                                "setting": "inpatient",
+                                "service_code": [],
+                                "billing_code_modifier": [],
+                                "expiration_date": "2026-12-31"
+                            }
+                        ]
+                    },
+
+                    {
+                        "provider_references": [102],
+
+                        "negotiated_prices": [
+                            {
+                                "negotiated_type": "negotiated",
+                                "negotiated_rate": 600.0,
+                                "billing_class": "institutional",
+                                "setting": "inpatient",
+                                "service_code": [],
+                                "billing_code_modifier": [],
+                                "expiration_date": "2026-12-31"
+                            }
+                        ]
+                    },
+
+                    {
+                        "provider_references": [101],
+
+                        "negotiated_prices": [
+                            {
+                                "negotiated_type": "negotiated",
+                                "negotiated_rate": 700.0,
+                                "billing_class": "institutional",
+                                "setting": "inpatient",
+                                "service_code": [],
+                                "billing_code_modifier": [],
+                                "expiration_date": "2026-12-31"
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
 
 
-class LocalServer:
-    """
-    Robust local HTTP fixture server.
+# ============================================================
+# LOCAL HTTP SERVER
+# ============================================================
 
-    The important difference from the previous fixture server is that every
-    response explicitly closes the connection. This avoids the local HTTP
-    fixture becoming the cause of runner-resume failures.
-    """
+class LocalFileServer:
 
-    def __init__(
-        self,
-        files: dict[str, bytes],
-        missing: set[str] | None = None
-    ):
+    def __init__(self, files, missing=None):
+
         self.files = files
         self.missing = missing or set()
 
         parent = self
 
         class Handler(BaseHTTPRequestHandler):
+
             protocol_version = "HTTP/1.1"
 
-            def do_GET(self):  # noqa: N802
-                name = self.path.split("?", 1)[0].lstrip("/")
+            def do_GET(self):
 
-                if name in parent.missing or name not in parent.files:
+                name = urllib.parse.urlparse(
+                    self.path
+                ).path.lstrip("/")
+
+                if (
+                    name in parent.missing
+                    or name not in parent.files
+                ):
+
                     body = b"not found"
 
                     self.send_response(404)
+
                     self.send_header(
                         "Content-Length",
                         str(len(body))
                     )
-                    self.send_header(
-                        "Connection",
-                        "close"
-                    )
+
                     self.end_headers()
 
                     self.wfile.write(body)
-                    self.close_connection = True
+
                     return
 
                 body = parent.files[name]
 
                 self.send_response(200)
+
                 self.send_header(
                     "Content-Type",
                     "application/octet-stream"
                 )
+
                 self.send_header(
                     "Content-Length",
                     str(len(body))
                 )
-                self.send_header(
-                    "Connection",
-                    "close"
-                )
+
                 self.end_headers()
 
                 self.wfile.write(body)
-                self.close_connection = True
 
             def log_message(self, *_args):
-                return
+                pass
 
         self.server = ThreadingHTTPServer(
             ("127.0.0.1", 0),
@@ -143,8 +368,11 @@ class LocalServer:
         )
 
     @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.server.server_port}"
+    def base_url(self):
+        return (
+            f"http://127.0.0.1:"
+            f"{self.server.server_port}"
+        )
 
     def start(self):
         self.thread.start()
@@ -156,93 +384,258 @@ class LocalServer:
         self.thread.join(timeout=2)
 
 
-def write_json(path: Path, obj: Any):
-    path.write_text(
-        json.dumps(obj, indent=2),
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def expect(condition, actual):
+    return (
+        "PASS" if condition else "FAIL",
+        actual
+    )
+
+
+def run_test(results, case, area, function):
+
+    started = time.perf_counter()
+
+    try:
+
+        status, actual = function()
+
+        results.append(
+            TestResult(
+                case=case,
+                area=area,
+                status=status,
+                actual=str(actual),
+                elapsed_ms=(
+                    time.perf_counter()
+                    - started
+                ) * 1000,
+            )
+        )
+
+    except Exception as exc:
+
+        results.append(
+            TestResult(
+                case=case,
+                area=area,
+                status="FAIL",
+                actual=(
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+                elapsed_ms=(
+                    time.perf_counter()
+                    - started
+                ) * 1000,
+                notes=traceback.format_exc(
+                    limit=5
+                ).replace("\n", " ")
+            )
+        )
+
+
+def new_db(path, repo):
+
+    import duckdb
+
+    con = duckdb.connect(str(path))
+
+    try:
+        con.execute(
+            (repo / "schema.sql").read_text(
+                encoding="utf-8"
+            )
+        )
+    finally:
+        con.close()
+
+
+def process_fixture(
+    db,
+    fixture,
+    repo,
+    label="fixture.json"
+):
+
+    import stream_parser
+
+    new_db(db, repo)
+
+    con = __import__("duckdb").connect(
+        str(db)
+    )
+
+    try:
+        stream_parser.process_file(
+            con,
+            str(fixture),
+            label
+        )
+    finally:
+        con.close()
+
+
+def counts(db):
+
+    import duckdb
+
+    con = duckdb.connect(
+        str(db),
+        read_only=True
+    )
+
+    try:
+
+        result = {}
+
+        for table in (
+            "payers",
+            "billing_codes",
+            "negotiated_rates",
+            "providers"
+        ):
+
+            result[table] = int(
+                con.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+            )
+
+        return result
+
+    finally:
+        con.close()
+
+
+# ============================================================
+# FIXTURES
+# ============================================================
+
+def create_fixtures(root):
+
+    raw = json.dumps(
+        synthetic_mrf(),
+        separators=(",", ":")
+    ).encode()
+
+    plain = root / "fixture.json"
+    plain.write_bytes(raw)
+
+    second = root / "fixture-second.json"
+
+    second.write_text(
+        json.dumps(
+            synthetic_mrf("SYNTH-02")
+        ),
         encoding="utf-8"
     )
 
+    return plain, second
 
-def run_cmd(
-    cmd: list[str],
-    cwd: Path,
-    timeout: int = 300
-) -> subprocess.CompletedProcess[str]:
 
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        timeout=timeout
+# ============================================================
+# TC-10
+# ============================================================
+
+def tc10(root, repo, plain, second):
+
+    import duckdb
+    import stream_parser
+
+    db = root / "tc10.duckdb"
+
+    new_db(db, repo)
+
+    con = duckdb.connect(str(db))
+
+    try:
+
+        stream_parser.process_file(
+            con,
+            str(plain),
+            "fixture.json"
+        )
+
+        stream_parser.process_file(
+            con,
+            str(second),
+            "fixture-second.json"
+        )
+
+    finally:
+        con.close()
+
+    con = duckdb.connect(
+        str(db),
+        read_only=True
+    )
+
+    try:
+
+        synthetic_ids = int(
+            con.execute(
+                """
+                SELECT COUNT(DISTINCT provider_reference_id)
+                FROM providers
+                WHERE provider_reference_id < 0
+                """
+            ).fetchone()[0]
+        )
+
+        payers = int(
+            con.execute(
+                "SELECT COUNT(*) FROM payers"
+            ).fetchone()[0]
+        )
+
+    finally:
+        con.close()
+
+    return expect(
+        synthetic_ids == 1 and payers == 2,
+        (
+            f"distinct_negative_ids="
+            f"{synthetic_ids}; "
+            f"payer_rows={payers}"
+        )
     )
 
 
-def read_progress(path: Path) -> int:
-    try:
-        return int(
-            path.read_text(
-                encoding="utf-8"
-            ).strip() or "0"
-        )
-    except Exception:
-        return 0
+# ============================================================
+# ACQUISITION TESTS
+# ============================================================
 
+def acquisition_tests(
+    results,
+    root,
+    repo
+):
 
-def read_events(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-
-    out = []
-
-    for line in path.read_text(
-        encoding="utf-8",
-        errors="replace"
-    ).splitlines():
-
-        if not line.strip():
-            continue
-
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            pass
-
-    return out
-
-
-def runner_integration(
-    repo: Path,
-    root: Path,
-    mod
-) -> list[Result]:
-
-    results: list[Result] = []
-
-    raw = [
-        json.dumps(
-            mod.synthetic_mrf("RUN-T01"),
-            separators=(",", ":")
-        ).encode(),
-
-        json.dumps(
-            mod.synthetic_mrf("RUN-T02"),
-            separators=(",", ":")
-        ).encode(),
-
-        json.dumps(
-            mod.synthetic_mrf("RUN-T03"),
-            separators=(",", ":")
-        ).encode(),
-    ]
+    import ingest_utils
 
     files = {
-        "file1.json": raw[0],
-        "file2.json": raw[1],
-        "file3.json": raw[2],
+        "file1.bin": b"alpha" * 100,
+        "file2.bin": b"beta" * 100,
+        "file3.bin": b"gamma" * 100,
+        "file1.json": json.dumps(
+            synthetic_mrf("RUN-01"),
+            separators=(",", ":")
+        ).encode(),
+        "file2.json": json.dumps(
+            synthetic_mrf("RUN-02"),
+            separators=(",", ":")
+        ).encode(),
+        "file3.json": json.dumps(
+            synthetic_mrf("RUN-03"),
+            separators=(",", ":")
+        ).encode(),
     }
 
-    server = LocalServer(
+    server = LocalFileServer(
         files,
         missing={"missing.bin"}
     ).start()
@@ -251,31 +644,43 @@ def runner_integration(
 
         manifest = root / "runner_manifest.json"
         progress = root / "runner_progress.txt"
-        log = root / "runner_runs.jsonl"
+        run_log = root / "runner_runs.jsonl"
         db = root / "runner.duckdb"
-        downloads = root / "downloads"
+        download_dir = root / "downloads"
 
-        write_json(
-            manifest,
-            {
-                "blobs": [
-                    {
-                        "name": name,
-                        "downloadUrl": f"{server.url}/{name}",
-                        "size_bytes": len(files[name])
-                    }
-                    for name in (
-                        "file1.json",
-                        "file2.json",
-                        "file3.json"
-                    )
-                ]
-            }
+        manifest.write_text(
+            json.dumps(
+                {
+                    "blobs": [
+                        {
+                            "name": "file1.json",
+                            "downloadUrl":
+                                f"{server.base_url}/file1.json",
+                            "size_bytes":
+                                len(files["file1.json"])
+                        },
+                        {
+                            "name": "file2.json",
+                            "downloadUrl":
+                                f"{server.base_url}/file2.json",
+                            "size_bytes":
+                                len(files["file2.json"])
+                        },
+                        {
+                            "name": "file3.json",
+                            "downloadUrl":
+                                f"{server.base_url}/file3.json",
+                            "size_bytes":
+                                len(files["file3.json"])
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8"
         )
 
-        def run_runner(
-            max_files: int | None = None
-        ):
+        def run_runner(max_files=None):
+
             cmd = [
                 sys.executable,
                 str(repo / "runner.py"),
@@ -293,468 +698,270 @@ def runner_integration(
                 str(repo / "schema.sql"),
 
                 "--download-dir",
-                str(downloads),
+                str(download_dir),
 
                 "--run-log",
-                str(log)
+                str(run_log)
             ]
 
             if max_files is not None:
-                cmd += [
+
+                cmd.extend([
                     "--max-files",
                     str(max_files)
-                ]
+                ])
 
-            return run_cmd(cmd, repo)
+            return subprocess.run(
+                cmd,
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
 
-        # -------------------------------------------------------------
+        # ----------------------------------------------------
         # TC-19
-        #
-        # Run two files first, then resume from progress=2.
-        # -------------------------------------------------------------
+        # ----------------------------------------------------
 
-        if progress.exists():
-            progress.unlink()
+        def tc19():
 
-        if log.exists():
-            log.unlink()
-
-        if db.exists():
-            db.unlink()
-
-        if downloads.exists():
-            shutil.rmtree(downloads)
-
-        first = run_runner(2)
-
-        second = run_runner()
-
-        events = read_events(log)
-
-        complete = [
-            e
-            for e in events
-            if e.get("status") == "complete"
-        ]
-
-        left = (
-            [
-                p.name
-                for p in downloads.glob("*")
-            ]
-            if downloads.exists()
-            else []
-        )
-
-        ok19 = (
-            first.returncode == 0
-            and second.returncode == 0
-            and read_progress(progress) == 3
-            and len(complete) == 3
-            and not left
-        )
-
-        details19 = (
-            f"first_rc={first.returncode}; "
-            f"second_rc={second.returncode}; "
-            f"progress={read_progress(progress)}; "
-            f"complete_events={len(complete)}; "
-            f"downloads_left={left}"
-        )
-
-        results.append(
-            Result(
-                "TC-19",
-                "PASS" if ok19 else "FAIL",
-                details19,
-                "Resume check uses a connection-closing local HTTP fixture."
-            )
-        )
-
-        # -------------------------------------------------------------
-        # TC-20
-        #
-        # No work remains after all files have completed.
-        # -------------------------------------------------------------
-
-        third = run_runner()
-
-        ok20 = (
-            third.returncode == 0
-            and
-            "All files have already been processed!"
-            in third.stdout
-        )
-
-        details20 = (
-            f"returncode={third.returncode}; "
-            f"message_found="
-            f"{'All files have already been processed!' in third.stdout}"
-        )
-
-        results.append(
-            Result(
-                "TC-20",
-                "PASS" if ok20 else "FAIL",
-                details20
-            )
-        )
-
-        # -------------------------------------------------------------
-        # TC-21
-        #
-        # Missing download must be logged as failed and progress must
-        # remain at zero.
-        # -------------------------------------------------------------
-
-        fm = root / "failure_manifest.json"
-        fp = root / "failure_progress.txt"
-        fl = root / "failure_runs.jsonl"
-        fd = root / "failure.duckdb"
-        fdir = root / "failure_downloads"
-
-        write_json(
-            fm,
-            {
-                "blobs": [
-                    {
-                        "name": "missing.bin",
-                        "downloadUrl":
-                            f"{server.url}/missing.bin",
-                        "size_bytes": 50
-                    },
-                    {
-                        "name": "file1.json",
-                        "downloadUrl":
-                            f"{server.url}/file1.json",
-                        "size_bytes":
-                            len(files["file1.json"])
-                    },
-                ]
-            }
-        )
-
-        proc = run_cmd(
-            [
-                sys.executable,
-                str(repo / "runner.py"),
-
-                "--manifest",
-                str(fm),
-
-                "--db",
-                str(fd),
-
-                "--progress",
-                str(fp),
-
-                "--schema",
-                str(repo / "schema.sql"),
-
-                "--download-dir",
-                str(fdir),
-
-                "--run-log",
-                str(fl)
-            ],
-            repo,
-            timeout=180
-        )
-
-        fevents = read_events(fl)
-
-        failed = [
-            e
-            for e in fevents
-            if e.get("status") == "failed"
-        ]
-
-        ok21 = (
-            proc.returncode == 0
-            and read_progress(fp) == 0
-            and len(failed) >= 1
-        )
-
-        details21 = (
-            f"returncode={proc.returncode}; "
-            f"progress={read_progress(fp)}; "
-            f"failed_events={len(failed)}"
-        )
-
-        results.append(
-            Result(
-                "TC-21",
-                "PASS" if ok21 else "FAIL",
-                details21,
-                "Runner should handle the download failure internally "
-                "and stop without advancing progress."
-            )
-        )
-
-    finally:
-        server.stop()
-
-    return results
-
-
-def make_validation_baseline(
-    db: Path,
-    repo: Path,
-    mod
-):
-    """
-    Create a deliberately clean validation fixture.
-
-    The fact table explicitly inserts all 13 schema columns, including
-    ingested_at, so the synthetic fixture cannot fail because of a
-    column/value-count mismatch.
-    """
-
-    import duckdb
-
-    mod.new_transparency_db(
-        db,
-        repo
-    )
-
-    con = duckdb.connect(str(db))
-
-    try:
-
-        payer = con.execute(
-            """
-            INSERT INTO payers (
-                reporting_entity_name,
-                reporting_entity_type,
-                plan_name,
-                plan_id,
-                plan_id_type,
-                plan_market_type,
-                last_updated_on,
-                version,
-                source_file
-            )
-            VALUES (?,?,?,?,?,?,?,?,?)
-            RETURNING payer_id
-            """,
-            (
-                "Synthetic Cigna Test Payer",
-                "health insurance issuer",
-                "Plan",
-                "P-VALID",
-                "HIOS",
-                "group",
-                "2026-09-01",
-                "1",
-                "valid.json",
-            )
-        ).fetchone()[0]
-
-        code = con.execute(
-            """
-            INSERT INTO billing_codes (
-                billing_code,
-                billing_code_type,
-                billing_code_type_version,
-                description,
-                name,
-                negotiation_arrangement
-            )
-            VALUES (?,?,?,?,?,?)
-            RETURNING code_id
-            """,
-            (
-                "99213",
-                "CPT",
-                "2026",
-                "Office visit",
-                "Office Visit",
-                "ffs",
-            )
-        ).fetchone()[0]
-
-        npi = mod.NPI_ORG
-
-        con.execute(
-            """
-            INSERT INTO providers (
-                provider_reference_id,
-                npi,
-                tin_type,
-                tin_value,
-                facility_name,
-                network_name,
-                group_key
-            )
-            VALUES (?,?,?,?,?,?,?)
-            """,
-            (
-                101,
-                npi,
-                "ein",
-                "12-3456789",
-                "Valid Facility",
-                ["Synthetic Network"],
-                "ref:101",
-            )
-        )
-
-        # Explicitly all 13 negotiated_rates columns.
-        con.execute(
-            """
-            INSERT INTO negotiated_rates (
-                payer_id,
-                code_id,
-                negotiation_arrangement,
-                billing_class,
-                setting,
-                negotiated_type,
-                negotiated_rate,
-                service_code,
-                billing_code_modifier,
-                expiration_date,
-                provider_reference_ids,
-                source_file,
-                ingested_at
-            )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?, ?, CURRENT_TIMESTAMP)
-            """,
-            (
-                payer,
-                code,
-                "ffs",
-                "institutional",
-                "outpatient",
-                "negotiated",
-                125.0,
-                ["11"],
-                [],
-                "2026-12-31",
-                [101],
-                "valid.json",
-            )
-        )
-
-        con.execute("CHECKPOINT")
-
-    finally:
-        con.close()
-
-
-def validation_case(
-    repo: Path,
-    db: Path,
-    outdir: Path,
-    fast: bool = False
-):
-
-    txt = outdir / (
-        db.stem +
-        ("_fast.txt" if fast else ".txt")
-    )
-
-    js = outdir / (
-        db.stem +
-        ("_fast.json" if fast else ".json")
-    )
-
-    cmd = [
-        sys.executable,
-        str(repo / "validate_data.py"),
-
-        "--db",
-        str(db),
-
-        "--txt",
-        str(txt),
-
-        "--json",
-        str(js),
-
-        "--fail-on",
-        "error"
-    ]
-
-    if fast:
-        cmd.append("--fast")
-
-    p = run_cmd(
-        cmd,
-        repo,
-        timeout=180
-    )
-
-    data = (
-        json.loads(
-            js.read_text(
+            progress.write_text(
+                "2",
                 encoding="utf-8"
             )
+
+            proc = run_runner()
+
+            value = int(
+                progress.read_text(
+                    encoding="utf-8"
+                ).strip()
+            )
+
+            complete_events = 0
+
+            if run_log.exists():
+
+                for line in run_log.read_text(
+                    encoding="utf-8"
+                ).splitlines():
+
+                    if (
+                        line.strip()
+                        and json.loads(line).get(
+                            "status"
+                        ) == "complete"
+                    ):
+
+                        complete_events += 1
+
+            remaining = []
+
+            if download_dir.exists():
+
+                remaining = [
+                    p.name
+                    for p in download_dir.glob("*")
+                ]
+
+            return expect(
+                proc.returncode == 0
+                and value == 3
+                and complete_events >= 1
+                and not remaining,
+
+                (
+                    f"returncode={proc.returncode}; "
+                    f"progress={value}; "
+                    f"complete_events={complete_events}; "
+                    f"downloads_left={remaining}"
+                )
+            )
+
+        run_test(
+            results,
+            "TC-19",
+            "Acquisition / Runner",
+            tc19
         )
-        if js.exists()
-        else []
-    )
 
-    return p, data
+        # ----------------------------------------------------
+        # TC-20
+        # ----------------------------------------------------
+
+        def tc20():
+
+            proc = run_runner()
+
+            matched = (
+                "All files have already been processed!"
+                in proc.stdout
+            )
+
+            return expect(
+                proc.returncode == 0
+                and matched,
+
+                (
+                    f"returncode={proc.returncode}; "
+                    f"matched_message={matched}"
+                )
+            )
+
+        run_test(
+            results,
+            "TC-20",
+            "Acquisition / Runner",
+            tc20
+        )
+
+        # ----------------------------------------------------
+        # TC-21
+        # ----------------------------------------------------
+
+        def tc21():
+
+            fail_manifest = (
+                root / "failure_manifest.json"
+            )
+
+            fail_progress = (
+                root / "failure_progress.txt"
+            )
+
+            fail_log = (
+                root / "failure_runs.jsonl"
+            )
+
+            fail_db = (
+                root / "failure.duckdb"
+            )
+
+            fail_downloads = (
+                root / "failure_downloads"
+            )
+
+            fail_manifest.write_text(
+                json.dumps(
+                    {
+                        "blobs": [
+                            {
+                                "name": "missing.bin",
+                                "downloadUrl":
+                                    f"{server.base_url}/missing.bin",
+                                "size_bytes": 50
+                            },
+                            {
+                                "name": "file1.bin",
+                                "downloadUrl":
+                                    f"{server.base_url}/file1.bin",
+                                "size_bytes":
+                                    len(files["file1.bin"])
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8"
+            )
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(repo / "runner.py"),
+
+                    "--manifest",
+                    str(fail_manifest),
+
+                    "--db",
+                    str(fail_db),
+
+                    "--progress",
+                    str(fail_progress),
+
+                    "--schema",
+                    str(repo / "schema.sql"),
+
+                    "--download-dir",
+                    str(fail_downloads),
+
+                    "--run-log",
+                    str(fail_log)
+                ],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+
+            progress_value = 0
+
+            if fail_progress.exists():
+
+                progress_value = int(
+                    fail_progress.read_text(
+                        encoding="utf-8"
+                    ).strip()
+                )
+
+            events = []
+
+            if fail_log.exists():
+
+                events = [
+                    json.loads(line)
+                    for line in fail_log.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    if line.strip()
+                ]
+
+            failed = any(
+                e.get("status") == "failed"
+                for e in events
+            )
+
+            return expect(
+                proc.returncode == 0
+                and progress_value == 0
+                and failed,
+
+                (
+                    f"returncode={proc.returncode}; "
+                    f"progress={progress_value}; "
+                    f"failed_event={failed}"
+                )
+            )
+
+        run_test(
+            results,
+            "TC-21",
+            "Acquisition / Runner",
+            tc21
+        )
+
+    finally:
+
+        server.stop()
 
 
-def check_by_name(
-    data: list[dict[str, Any]],
-    name: str
+# ============================================================
+# BENCHMARK FIXTURE
+# ============================================================
+
+def create_benchmark_fixture(
+    root,
+    repo
 ):
 
-    return next(
-        (
-            x for x in data
-            if x.get("name") == name
-        ),
-        None
-    )
-
-
-def benchmark_case(
-    repo: Path,
-    root: Path,
-    mod,
-    approx: bool
-) -> tuple[Path, str]:
-
-    """
-    Create a benchmark fixture with all 13 negotiated_rates columns
-    explicitly supplied.
-    """
-
     import duckdb
-    import build_benchmarks
 
-    suffix = (
-        "approx"
-        if approx
-        else "exact"
-    )
+    db = root / "benchmark.duckdb"
+    enrichment = root / "enrichment.duckdb"
 
-    db = root / (
-        f"benchmark_{suffix}.duckdb"
-    )
-
-    enr = root / (
-        f"enrichment_{suffix}.duckdb"
-    )
-
-    # -------------------------------------------------------------
-    # Core DB
-    # -------------------------------------------------------------
-
-    mod.new_transparency_db(
-        db,
-        repo
-    )
-
-    # -------------------------------------------------------------
-    # Enrichment DB
-    # -------------------------------------------------------------
+    new_db(db, repo)
 
     e = duckdb.connect(
-        str(enr)
+        str(enrichment)
     )
 
     try:
@@ -805,12 +1012,12 @@ def benchmark_case(
 
         e.executemany(
             """
-            INSERT INTO nppes
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO nppes VALUES
+            (?,?,?,?,?,?,?,?,?,?,?)
             """,
             [
                 (
-                    mod.NPI_ORG,
+                    NPI_ORG,
                     "2",
                     "Org Provider",
                     None,
@@ -820,10 +1027,10 @@ def benchmark_case(
                     "TX",
                     "77001",
                     "207Q00000X",
-                    "Y",
+                    "Y"
                 ),
                 (
-                    mod.NPI_INDIV,
+                    NPI_INDIV,
                     "1",
                     "Individual Provider",
                     "Ada",
@@ -833,10 +1040,10 @@ def benchmark_case(
                     "TX",
                     "77001",
                     "207R00000X",
-                    "Y",
+                    "Y"
                 ),
                 (
-                    mod.NPI_ORG_2,
+                    NPI_ORG_2,
                     "2",
                     "Second Provider",
                     None,
@@ -846,15 +1053,15 @@ def benchmark_case(
                     "TX",
                     "77001",
                     "207Q00000X",
-                    "Y",
-                ),
+                    "Y"
+                )
             ]
         )
 
         e.executemany(
             """
-            INSERT INTO zip_county
-            VALUES (?,?,?,?,?)
+            INSERT INTO zip_county VALUES
+            (?,?,?,?,?)
             """,
             [
                 (
@@ -862,15 +1069,15 @@ def benchmark_case(
                     "48201",
                     "Harris County",
                     "TX",
-                    0.7,
+                    0.7
                 ),
                 (
                     "77001",
                     "48157",
                     "Fort Bend County",
                     "TX",
-                    0.3,
-                ),
+                    0.3
+                )
             ]
         )
 
@@ -882,7 +1089,7 @@ def benchmark_case(
             (
                 "99213",
                 "CPT",
-                "Office o/p visit est",
+                "Office o/p visit est"
             )
         )
 
@@ -891,13 +1098,7 @@ def benchmark_case(
     finally:
         e.close()
 
-    # -------------------------------------------------------------
-    # Populate transparency DB
-    # -------------------------------------------------------------
-
-    c = duckdb.connect(
-        str(db)
-    )
+    c = duckdb.connect(str(db))
 
     try:
 
@@ -926,7 +1127,7 @@ def benchmark_case(
                 "group",
                 "2026-09-01",
                 "1",
-                "p1.json",
+                "p1.json"
             )
         ).fetchone()[0]
 
@@ -955,7 +1156,7 @@ def benchmark_case(
                 "group",
                 "2026-09-01",
                 "1",
-                "p2.json",
+                "p2.json"
             )
         ).fetchone()[0]
 
@@ -978,7 +1179,7 @@ def benchmark_case(
                 "2026",
                 "MRF office visit",
                 "Office Visit",
-                "ffs",
+                "ffs"
             )
         ).fetchone()[0]
 
@@ -1001,7 +1202,7 @@ def benchmark_case(
                 "2026",
                 "MRF DRG",
                 "DRG 470",
-                "ffs",
+                "ffs"
             )
         ).fetchone()[0]
 
@@ -1021,35 +1222,35 @@ def benchmark_case(
             [
                 (
                     101,
-                    mod.NPI_INDIV,
+                    NPI_INDIV,
                     "ein",
                     "12-3456789",
                     "Individual Facility",
                     ["Network"],
-                    "ref:101",
+                    "ref:101"
                 ),
                 (
                     101,
-                    mod.NPI_ORG,
+                    NPI_ORG,
                     "ein",
                     "12-3456789",
                     "Organization Facility",
                     ["Network"],
-                    "ref:101",
+                    "ref:101"
                 ),
                 (
                     102,
-                    mod.NPI_ORG_2,
+                    NPI_ORG_2,
                     "ein",
                     "98-7654321",
                     "Second Facility",
                     ["Network 2"],
-                    "ref:102",
-                ),
+                    "ref:102"
+                )
             ]
         )
 
-        rows = [
+        rates = [
             (
                 p1,
                 code1,
@@ -1062,7 +1263,7 @@ def benchmark_case(
                 [],
                 "2026-12-31",
                 [101],
-                "p1.json",
+                "p1.json"
             ),
             (
                 p1,
@@ -1076,7 +1277,7 @@ def benchmark_case(
                 [],
                 "2026-12-31",
                 [101],
-                "p1.json",
+                "p1.json"
             ),
             (
                 p2,
@@ -1090,7 +1291,7 @@ def benchmark_case(
                 [],
                 "2026-12-31",
                 [101],
-                "p2.json",
+                "p2.json"
             ),
             (
                 p2,
@@ -1104,7 +1305,7 @@ def benchmark_case(
                 [],
                 "2026-12-31",
                 [102],
-                "p2.json",
+                "p2.json"
             ),
             (
                 p1,
@@ -1118,7 +1319,7 @@ def benchmark_case(
                 [],
                 "2026-12-31",
                 [101],
-                "p1.json",
+                "p1.json"
             ),
             (
                 p1,
@@ -1132,7 +1333,7 @@ def benchmark_case(
                 [],
                 "2026-12-31",
                 [102],
-                "p1.json",
+                "p1.json"
             ),
             (
                 p2,
@@ -1146,8 +1347,8 @@ def benchmark_case(
                 [],
                 "2026-12-31",
                 [101],
-                "p2.json",
-            ),
+                "p2.json"
+            )
         ]
 
         c.executemany(
@@ -1164,15 +1365,11 @@ def benchmark_case(
                 billing_code_modifier,
                 expiration_date,
                 provider_reference_ids,
-                source_file,
-                ingested_at
+                source_file
             )
-            VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,
-                CURRENT_TIMESTAMP
-            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            rows
+            rates
         )
 
         c.execute("CHECKPOINT")
@@ -1180,421 +1377,592 @@ def benchmark_case(
     finally:
         c.close()
 
-    # -------------------------------------------------------------
-    # Actual repository benchmark builder
-    # -------------------------------------------------------------
+    return db, enrichment
 
-    started = time.perf_counter()
 
-    build_benchmarks.build(
+# ============================================================
+# TC-23 / TC-27
+# ============================================================
+
+def benchmark_tests(
+    results,
+    root,
+    repo
+):
+
+    import duckdb
+    import build_benchmarks
+
+    # --------------------------------------------------------
+    # TC-23
+    # --------------------------------------------------------
+
+    def tc23():
+
+        db, enrichment = create_benchmark_fixture(
+            root,
+            repo
+        )
+
+        build_benchmarks.build(
+            str(db),
+            str(enrichment),
+            True,
+            False,
+            False,
+            False,
+            2,
+            "512MB",
+            str(root / "duckdb_tmp"),
+            False
+        )
+
+        con = duckdb.connect(
+            str(db),
+            read_only=True
+        )
+
+        try:
+
+            tables = {
+                row[0]
+                for row in con.execute(
+                    "SHOW TABLES"
+                ).fetchall()
+            }
+
+        finally:
+            con.close()
+
+        expected = {
+            "benchmarks_code_stats",
+            "benchmarks_geo_stats",
+            "benchmarks_geo_payer_stats",
+            "benchmarks_payer_stats",
+            "benchmarks_payer_provider_stats",
+            "benchmarks_provider_stats"
+        }
+
+        actual_stats = {
+            t for t in tables
+            if t.startswith("benchmarks_")
+            and t.endswith("stats")
+        }
+
+        return expect(
+            "benchmarks" in tables
+            and actual_stats == expected,
+
+            (
+                f"benchmark_tables="
+                f"{sorted(tables)}; "
+                f"benchmark_stat_tables="
+                f"{sorted(actual_stats)}"
+            )
+        )
+
+    run_test(
+        results,
+        "TC-23",
+        "Benchmark",
+        tc23
+    )
+
+    # --------------------------------------------------------
+    # TC-27
+    # --------------------------------------------------------
+
+    def tc27():
+
+        db, enrichment = create_benchmark_fixture(
+            root,
+            repo
+        )
+
+        build_benchmarks.build(
+            str(db),
+            str(enrichment),
+            True,
+            False,
+            False,
+            False,
+            2,
+            "512MB",
+            str(root / "duckdb_tmp_approx"),
+            True
+        )
+
+        con = duckdb.connect(
+            str(db),
+            read_only=True
+        )
+
+        try:
+
+            n = int(
+                con.execute(
+                    "SELECT COUNT(*) FROM benchmarks"
+                ).fetchone()[0]
+            )
+
+            tables = {
+                row[0]
+                for row in con.execute(
+                    "SHOW TABLES"
+                ).fetchall()
+            }
+
+        finally:
+            con.close()
+
+        stats = [
+            t for t in tables
+            if t.startswith("benchmarks_")
+            and t.endswith("stats")
+        ]
+
+        return expect(
+            n == 4 and len(stats) == 6,
+
+            (
+                f"benchmark_rows={n}; "
+                f"stats_tables={sorted(stats)}"
+            )
+        )
+
+    run_test(
+        results,
+        "TC-27",
+        "Benchmark",
+        tc27
+    )
+
+
+# ============================================================
+# VALIDATION HELPERS
+# ============================================================
+
+def validation_run(
+    repo,
+    db,
+    out_dir,
+    fast=False
+):
+
+    txt = out_dir / (
+        db.stem
+        + ("_fast.txt" if fast else ".txt")
+    )
+
+    js = out_dir / (
+        db.stem
+        + ("_fast.json" if fast else ".json")
+    )
+
+    cmd = [
+        sys.executable,
+        str(repo / "validate_data.py"),
+        "--db",
         str(db),
-        str(enr),
-        True,
-        False,
-        False,
-        False,
-        2,
-        "512MB",
-        str(root / "duckdb_tmp"),
-        approx
+        "--txt",
+        str(txt),
+        "--json",
+        str(js),
+        "--fail-on",
+        "error"
+    ]
+
+    if fast:
+        cmd.append("--fast")
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=300
     )
 
-    elapsed_ms = (
-        time.perf_counter() - started
-    ) * 1000
+    data = []
 
-    return db, f"build_elapsed_ms={elapsed_ms:.1f}"
+    if js.exists():
 
-
-def main() -> int:
-
-    repo = Path.cwd().resolve()
-
-    if (
-        not (repo / "runner.py").exists()
-        or
-        not (repo / "schema.sql").exists()
-    ):
-        print(
-            "ERROR: run this from the TiC repository root."
+        data = json.loads(
+            js.read_text(
+                encoding="utf-8"
+            )
         )
-        return 2
 
-    mod = load_previous_runner(repo)
+    return proc, data
 
-    root = Path(
-        tempfile.mkdtemp(
-            prefix="tic_targeted_",
-            dir=str(repo)
-        )
+
+def find_check(data, name):
+
+    for row in data:
+
+        if row.get("name") == name:
+            return row
+
+    return {}
+
+
+def copy_db(src, dst):
+    shutil.copy2(src, dst)
+
+
+# ============================================================
+# VALIDATION TESTS
+# ============================================================
+
+def validation_tests(
+    results,
+    root,
+    repo,
+    plain
+):
+
+    import duckdb
+
+    valid_db = (
+        root / "validation_valid.duckdb"
     )
 
-    outdir = (
-        repo /
-        "thesis_targeted_evidence"
+    process_fixture(
+        valid_db,
+        plain,
+        repo
     )
 
-    outdir.mkdir(
+    reports = (
+        root / "validation_reports"
+    )
+
+    reports.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    results: list[Result] = []
+    # --------------------------------------------------------
+    # TC-29
+    # --------------------------------------------------------
 
-    try:
+    def tc29():
 
-        print(
-            "TiC / Cigna targeted thesis rerun (no API)"
-        )
-
-        print(
-            f"Repository: {repo}"
-        )
-
-        print(
-            f"Temporary test directory: {root}"
-        )
-
-        print()
-
-        # =============================================================
-        # TC-19, TC-20, TC-21
-        # =============================================================
-
-        print(
-            "[1/4] Runner cases TC-19 to TC-21 ..."
-        )
-
-        results.extend(
-            runner_integration(
-                repo,
-                root,
-                mod
-            )
-        )
-
-        # =============================================================
-        # TC-23
-        # =============================================================
-
-        print(
-            "[2/4] Benchmark cases TC-23 and TC-27 ..."
-        )
-
-        try:
-
-            db, timing = benchmark_case(
-                repo,
-                root,
-                mod,
-                approx=False
-            )
-
-            import duckdb
-
-            con = duckdb.connect(
-                str(db),
-                read_only=True
-            )
-
-            try:
-
-                tables = {
-                    r[0]
-                    for r in con.execute(
-                        "SHOW TABLES"
-                    ).fetchall()
-                }
-
-            finally:
-                con.close()
-
-            expected_stats = {
-                "benchmarks_code_stats",
-                "benchmarks_geo_stats",
-                "benchmarks_geo_payer_stats",
-                "benchmarks_payer_stats",
-                "benchmarks_payer_provider_stats",
-                "benchmarks_provider_stats",
-            }
-
-            actual_stats = {
-                t
-                for t in tables
-                if (
-                    t.startswith("benchmarks_")
-                    and
-                    t.endswith("stats")
-                )
-            }
-
-            ok23 = (
-                "benchmarks" in tables
-                and
-                actual_stats == expected_stats
-            )
-
-            results.append(
-                Result(
-                    "TC-23",
-                    "PASS" if ok23 else "FAIL",
-                    (
-                        f"benchmark_present="
-                        f"{'benchmarks' in tables}; "
-                        f"stat_tables="
-                        f"{sorted(actual_stats)}; "
-                        f"{timing}"
-                    )
-                )
-            )
-
-        except Exception as e:
-
-            results.append(
-                Result(
-                    "TC-23",
-                    "FAIL",
-                    f"{type(e).__name__}: {e}"
-                )
-            )
-
-        # =============================================================
-        # TC-27
-        # =============================================================
-
-        try:
-
-            db, timing = benchmark_case(
-                repo,
-                root,
-                mod,
-                approx=True
-            )
-
-            import duckdb
-
-            con = duckdb.connect(
-                str(db),
-                read_only=True
-            )
-
-            try:
-
-                n = int(
-                    con.execute(
-                        "SELECT COUNT(*) FROM benchmarks"
-                    ).fetchone()[0]
-                )
-
-                tables = {
-                    r[0]
-                    for r in con.execute(
-                        "SHOW TABLES"
-                    ).fetchall()
-                }
-
-            finally:
-                con.close()
-
-            expected_stats = {
-                "benchmarks_code_stats",
-                "benchmarks_geo_stats",
-                "benchmarks_geo_payer_stats",
-                "benchmarks_payer_stats",
-                "benchmarks_payer_provider_stats",
-                "benchmarks_provider_stats",
-            }
-
-            actual_stats = {
-                t
-                for t in tables
-                if (
-                    t.startswith("benchmarks_")
-                    and
-                    t.endswith("stats")
-                )
-            }
-
-            ok27 = (
-                n == 4
-                and
-                actual_stats == expected_stats
-            )
-
-            results.append(
-                Result(
-                    "TC-27",
-                    "PASS" if ok27 else "FAIL",
-                    (
-                        f"benchmark_rows={n}; "
-                        f"stat_tables={sorted(actual_stats)}; "
-                        f"{timing}"
-                    )
-                )
-            )
-
-        except Exception as e:
-
-            results.append(
-                Result(
-                    "TC-27",
-                    "FAIL",
-                    f"{type(e).__name__}: {e}"
-                )
-            )
-
-        # =============================================================
-        # TC-29 through TC-33
-        # =============================================================
-
-        print(
-            "[3/4] Validation cases TC-29 to TC-33 ..."
-        )
-
-        valid_db = (
-            root /
-            "validation_valid.duckdb"
-        )
-
-        reports = (
-            root /
-            "validation_reports"
-        )
-
-        reports.mkdir(
-            exist_ok=True
-        )
-
-        make_validation_baseline(
-            valid_db,
+        proc, data = validation_run(
             repo,
-            mod
+            valid_db,
+            reports,
+            fast=False
         )
 
-        # -------------------------------------------------------------
-        # TC-29
-        # -------------------------------------------------------------
+        errors = [
+            r for r in data
+            if (
+                r.get("level") == "error"
+                and not r.get("passed")
+            )
+        ]
+
+        checks = [
+            r for r in data
+            if r.get("level") != "info"
+        ]
+
+        return expect(
+            proc.returncode == 0
+            and not errors,
+
+            (
+                f"returncode={proc.returncode}; "
+                f"error_failures={len(errors)}; "
+                f"checks={len(checks)}"
+            )
+        )
+
+    run_test(
+        results,
+        "TC-29",
+        "Validation",
+        tc29
+    )
+
+    # --------------------------------------------------------
+    # TC-30
+    # --------------------------------------------------------
+
+    def tc30():
+
+        proc, data = validation_run(
+            repo,
+            valid_db,
+            reports,
+            fast=True
+        )
+
+        skipped = [
+            r for r in data
+            if str(
+                r.get("note", "")
+            ).startswith(
+                "Skipped (--fast)"
+            )
+        ]
+
+        return expect(
+            proc.returncode == 0
+            and len(skipped) >= 1,
+
+            (
+                f"returncode={proc.returncode}; "
+                f"fast_skips={len(skipped)}"
+            )
+        )
+
+    run_test(
+        results,
+        "TC-30",
+        "Validation",
+        tc30
+    )
+
+    # --------------------------------------------------------
+    # TC-31
+    # --------------------------------------------------------
+
+    def tc31():
+
+        db = (
+            root /
+            "validation_orphan_payer.duckdb"
+        )
+
+        copy_db(
+            valid_db,
+            db
+        )
+
+        con = duckdb.connect(
+            str(db)
+        )
 
         try:
 
-            p, data = validation_case(
-                repo,
-                valid_db,
-                reports,
-                fast=False
-            )
+            row = con.execute(
+                """
+                SELECT
+                    payer_id,
+                    code_id,
+                    negotiation_arrangement,
+                    billing_class,
+                    setting,
+                    negotiated_type,
+                    negotiated_rate,
+                    service_code,
+                    billing_code_modifier,
+                    expiration_date,
+                    provider_reference_ids,
+                    source_file
+                FROM negotiated_rates
+                LIMIT 1
+                """
+            ).fetchone()
 
-            errors = [
-                x
-                for x in data
-                if (
-                    x.get("level") == "error"
-                    and
-                    not x.get("passed")
+            con.execute(
+                """
+                INSERT INTO negotiated_rates (
+                    payer_id,
+                    code_id,
+                    negotiation_arrangement,
+                    billing_class,
+                    setting,
+                    negotiated_type,
+                    negotiated_rate,
+                    service_code,
+                    billing_code_modifier,
+                    expiration_date,
+                    provider_reference_ids,
+                    source_file
                 )
-            ]
-
-            ok = (
-                p.returncode == 0
-                and
-                not errors
-            )
-
-            results.append(
-                Result(
-                    "TC-29",
-                    "PASS" if ok else "FAIL",
-                    (
-                        f"returncode={p.returncode}; "
-                        f"error_failures={len(errors)}"
-                    ),
-                    "A clean baseline should produce no error-level failures."
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    999999,
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                    row[5],
+                    row[6],
+                    row[7],
+                    row[8],
+                    row[9],
+                    row[10],
+                    row[11]
                 )
             )
 
-        except Exception as e:
-
-            results.append(
-                Result(
-                    "TC-29",
-                    "FAIL",
-                    f"{type(e).__name__}: {e}"
-                )
+            con.execute(
+                "CHECKPOINT"
             )
 
-        # -------------------------------------------------------------
-        # TC-30
-        # -------------------------------------------------------------
+        finally:
+            con.close()
+
+        proc, data = validation_run(
+            repo,
+            db,
+            reports
+        )
+
+        check = find_check(
+            data,
+            "orphan_payer_id"
+        )
+
+        return expect(
+            proc.returncode == 1
+            and not check.get(
+                "passed",
+                True
+            )
+            and check.get(
+                "n_bad",
+                0
+            ) >= 1,
+
+            (
+                f"returncode={proc.returncode}; "
+                f"orphan_payer={check}"
+            )
+        )
+
+    run_test(
+        results,
+        "TC-31",
+        "Validation",
+        tc31
+    )
+
+    # --------------------------------------------------------
+    # TC-32
+    # --------------------------------------------------------
+
+    def tc32():
+
+        db = (
+            root /
+            "validation_bad_npi.duckdb"
+        )
+
+        copy_db(
+            valid_db,
+            db
+        )
+
+        con = duckdb.connect(
+            str(db)
+        )
 
         try:
 
-            p, data = validation_case(
-                repo,
-                valid_db,
-                reports,
-                fast=True
-            )
-
-            skipped = [
-                x
-                for x in data
-                if str(
-                    x.get("note", "")
-                ).startswith(
-                    "Skipped (--fast)"
+            con.execute(
+                """
+                INSERT INTO providers (
+                    provider_reference_id,
+                    npi,
+                    tin_type,
+                    tin_value,
+                    facility_name,
+                    network_name,
+                    group_key
                 )
-            ]
-
-            ok = (
-                p.returncode == 0
-                and
-                len(skipped) >= 1
-            )
-
-            results.append(
-                Result(
-                    "TC-30",
-                    "PASS" if ok else "FAIL",
-                    (
-                        f"returncode={p.returncode}; "
-                        f"fast_skips={len(skipped)}"
-                    )
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    999,
+                    NPI_BAD,
+                    "ein",
+                    "12-3456789",
+                    "Bad NPI Facility",
+                    ["N"],
+                    "ref:999"
                 )
             )
 
-        except Exception as e:
-
-            results.append(
-                Result(
-                    "TC-30",
-                    "FAIL",
-                    f"{type(e).__name__}: {e}"
-                )
+            con.execute(
+                "CHECKPOINT"
             )
 
-        # -------------------------------------------------------------
-        # TC-31
-        # -------------------------------------------------------------
+        finally:
+            con.close()
+
+        proc, data = validation_run(
+            repo,
+            db,
+            reports
+        )
+
+        check = find_check(
+            data,
+            "npi_invalid"
+        )
+
+        return expect(
+            check.get("n_bad", 0) >= 1,
+
+            (
+                f"returncode={proc.returncode}; "
+                f"npi_invalid={check}"
+            )
+        )
+
+    run_test(
+        results,
+        "TC-32",
+        "Validation",
+        tc32
+    )
+
+    # --------------------------------------------------------
+    # TC-33
+    # --------------------------------------------------------
+
+    def tc33():
+
+        db = (
+            root /
+            "validation_domain.duckdb"
+        )
+
+        copy_db(
+            valid_db,
+            db
+        )
+
+        con = duckdb.connect(
+            str(db)
+        )
 
         try:
 
-            import duckdb
+            row = con.execute(
+                """
+                SELECT
+                    payer_id,
+                    code_id,
+                    negotiation_arrangement,
+                    billing_class,
+                    setting,
+                    expiration_date,
+                    provider_reference_ids,
+                    source_file
+                FROM negotiated_rates
+                LIMIT 1
+                """
+            ).fetchone()
 
-            db = (
-                root /
-                "validation_orphan_payer.duckdb"
-            )
-
-            shutil.copy2(
-                valid_db,
-                db
-            )
-
-            con = duckdb.connect(
-                str(db)
-            )
-
-            try:
+            # Two zero/negative rates.
+            for rate in (0.0, -1.0):
 
                 con.execute(
                     """
@@ -1610,107 +1978,77 @@ def main() -> int:
                         billing_code_modifier,
                         expiration_date,
                         provider_reference_ids,
-                        source_file,
-                        ingested_at
+                        source_file
                     )
-                    VALUES (
-                        ?,?,?,?,?,?,?,?,?,?,?,?,
-                        CURRENT_TIMESTAMP
-                    )
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        999999,
-                        1,
-                        "ffs",
-                        "institutional",
-                        "outpatient",
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        row[4],
                         "negotiated",
-                        125.0,
-                        ["11"],
+                        rate,
                         [],
-                        "2026-12-31",
-                        [101],
-                        "orphan.json",
+                        [],
+                        row[5],
+                        row[6],
+                        row[7]
                     )
                 )
 
-                con.execute("CHECKPOINT")
+            # Two outliers.
+            for rate in (
+                300000.0,
+                500000.0
+            ):
 
-            finally:
-                con.close()
-
-            p, data = validation_case(
-                repo,
-                db,
-                reports
-            )
-
-            chk = (
-                check_by_name(
-                    data,
-                    "orphan_payer_id"
-                )
-                or
-                {}
-            )
-
-            ok = (
-                p.returncode == 1
-                and
-                chk.get("passed") is False
-                and
-                int(
-                    chk.get(
-                        "n_bad",
-                        0
+                con.execute(
+                    """
+                    INSERT INTO negotiated_rates (
+                        payer_id,
+                        code_id,
+                        negotiation_arrangement,
+                        billing_class,
+                        setting,
+                        negotiated_type,
+                        negotiated_rate,
+                        service_code,
+                        billing_code_modifier,
+                        expiration_date,
+                        provider_reference_ids,
+                        source_file
                     )
-                ) >= 1
-            )
-
-            results.append(
-                Result(
-                    "TC-31",
-                    "PASS" if ok else "FAIL",
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
                     (
-                        f"returncode={p.returncode}; "
-                        f"orphan_payer={chk}"
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        row[4],
+                        "negotiated",
+                        rate,
+                        [],
+                        [],
+                        row[5],
+                        row[6],
+                        row[7]
                     )
                 )
-            )
 
-        except Exception as e:
+            # Invalid NPIs.
+            bad_npis = [
+                NPI_BAD,
+                NPI_BAD + 2,
+                3000000000
+            ]
 
-            results.append(
-                Result(
-                    "TC-31",
-                    "FAIL",
-                    f"{type(e).__name__}: {e}"
-                )
-            )
-
-        # -------------------------------------------------------------
-        # TC-32
-        # -------------------------------------------------------------
-
-        try:
-
-            import duckdb
-
-            db = (
-                root /
-                "validation_bad_npi.duckdb"
-            )
-
-            shutil.copy2(
-                valid_db,
-                db
-            )
-
-            con = duckdb.connect(
-                str(db)
-            )
-
-            try:
+            for idx, npi in enumerate(
+                bad_npis,
+                start=1
+            ):
 
                 con.execute(
                     """
@@ -1726,360 +2064,226 @@ def main() -> int:
                     VALUES (?,?,?,?,?,?,?)
                     """,
                     (
-                        999,
-                        mod.NPI_BAD,
+                        1000 + idx,
+                        npi,
                         "ein",
                         "12-3456789",
-                        "Bad NPI",
+                        f"Bad {idx}",
                         ["N"],
-                        "ref:999",
+                        f"ref:{1000 + idx}"
                     )
                 )
 
-                con.execute("CHECKPOINT")
-
-            finally:
-                con.close()
-
-            p, data = validation_case(
-                repo,
-                db,
-                reports
+            con.execute(
+                "CHECKPOINT"
             )
 
-            chk = (
-                check_by_name(
-                    data,
-                    "npi_invalid"
-                )
-                or
-                {}
-            )
+        finally:
+            con.close()
 
-            ok = (
-                int(
-                    chk.get(
-                        "n_bad",
-                        0
-                    )
-                ) >= 1
-            )
-
-            results.append(
-                Result(
-                    "TC-32",
-                    "PASS" if ok else "FAIL",
-                    (
-                        f"returncode={p.returncode}; "
-                        f"npi_invalid={chk}"
-                    )
-                )
-            )
-
-        except Exception as e:
-
-            results.append(
-                Result(
-                    "TC-32",
-                    "FAIL",
-                    f"{type(e).__name__}: {e}"
-                )
-            )
-
-        # -------------------------------------------------------------
-        # TC-33
-        # -------------------------------------------------------------
-
-        try:
-
-            import duckdb
-
-            db = (
-                root /
-                "validation_domain.duckdb"
-            )
-
-            shutil.copy2(
-                valid_db,
-                db
-            )
-
-            con = duckdb.connect(
-                str(db)
-            )
-
-            try:
-
-                # Two invalid zero/negative negotiated rates.
-                for rate in (
-                    0.0,
-                    -1.0
-                ):
-
-                    con.execute(
-                        """
-                        INSERT INTO negotiated_rates (
-                            payer_id,
-                            code_id,
-                            negotiation_arrangement,
-                            billing_class,
-                            setting,
-                            negotiated_type,
-                            negotiated_rate,
-                            service_code,
-                            billing_code_modifier,
-                            expiration_date,
-                            provider_reference_ids,
-                            source_file,
-                            ingested_at
-                        )
-                        VALUES (
-                            ?,?,?,?,?,?,?,?,?,?,?,?,
-                            CURRENT_TIMESTAMP
-                        )
-                        """,
-                        (
-                            1,
-                            1,
-                            "ffs",
-                            "institutional",
-                            "outpatient",
-                            "negotiated",
-                            rate,
-                            [],
-                            [],
-                            "2026-12-31",
-                            [101],
-                            "domain.json",
-                        )
-                    )
-
-                # Two high-rate outliers.
-                for rate in (
-                    300000.0,
-                    500000.0
-                ):
-
-                    con.execute(
-                        """
-                        INSERT INTO negotiated_rates (
-                            payer_id,
-                            code_id,
-                            negotiation_arrangement,
-                            billing_class,
-                            setting,
-                            negotiated_type,
-                            negotiated_rate,
-                            service_code,
-                            billing_code_modifier,
-                            expiration_date,
-                            provider_reference_ids,
-                            source_file,
-                            ingested_at
-                        )
-                        VALUES (
-                            ?,?,?,?,?,?,?,?,?,?,?,?,
-                            CURRENT_TIMESTAMP
-                        )
-                        """,
-                        (
-                            1,
-                            1,
-                            "ffs",
-                            "institutional",
-                            "outpatient",
-                            "negotiated",
-                            rate,
-                            [],
-                            [],
-                            "2026-12-31",
-                            [101],
-                            "domain.json",
-                        )
-                    )
-
-                # Invalid NPI values.
-                for idx, npi in enumerate(
-                    [
-                        mod.NPI_BAD,
-                        mod.NPI_BAD + 2,
-                        3000000000
-                    ],
-                    start=1
-                ):
-
-                    con.execute(
-                        """
-                        INSERT INTO providers (
-                            provider_reference_id,
-                            npi,
-                            tin_type,
-                            tin_value,
-                            facility_name,
-                            network_name,
-                            group_key
-                        )
-                        VALUES (?,?,?,?,?,?,?)
-                        """,
-                        (
-                            1000 + idx,
-                            npi,
-                            "ein",
-                            "12-3456789",
-                            f"Bad {idx}",
-                            ["N"],
-                            f"ref:{1000 + idx}",
-                        )
-                    )
-
-                con.execute("CHECKPOINT")
-
-            finally:
-                con.close()
-
-            p, data = validation_case(
-                repo,
-                db,
-                reports
-            )
-
-            z = (
-                check_by_name(
-                    data,
-                    "dollar_rate_not_positive"
-                )
-                or
-                {}
-            )
-
-            o = (
-                check_by_name(
-                    data,
-                    "dollar_rate_outlier"
-                )
-                or
-                {}
-            )
-
-            n = (
-                check_by_name(
-                    data,
-                    "npi_invalid"
-                )
-                or
-                {}
-            )
-
-            ok = (
-                p.returncode == 1
-                and
-                int(
-                    z.get(
-                        "n_bad",
-                        0
-                    )
-                ) >= 2
-                and
-                int(
-                    o.get(
-                        "n_bad",
-                        0
-                    )
-                ) >= 2
-                and
-                int(
-                    n.get(
-                        "n_bad",
-                        0
-                    )
-                ) >= 1
-            )
-
-            results.append(
-                Result(
-                    "TC-33",
-                    "PASS" if ok else "FAIL",
-                    (
-                        f"returncode={p.returncode}; "
-                        f"zero_rate={z}; "
-                        f"outlier={o}; "
-                        f"npi={n}"
-                    )
-                )
-            )
-
-        except Exception as e:
-
-            results.append(
-                Result(
-                    "TC-33",
-                    "FAIL",
-                    f"{type(e).__name__}: {e}"
-                )
-            )
-
-        # =============================================================
-        # Report
-        # =============================================================
-
-        print(
-            "[4/4] Writing report ..."
+        proc, data = validation_run(
+            repo,
+            db,
+            reports
         )
 
-        summary = {
-            k: sum(
-                r.status == k
+        zero_rate = find_check(
+            data,
+            "dollar_rate_not_positive"
+        )
+
+        outlier = find_check(
+            data,
+            "dollar_rate_outlier"
+        )
+
+        invalid_npi = find_check(
+            data,
+            "npi_invalid"
+        )
+
+        ok = (
+            proc.returncode == 1
+            and zero_rate.get(
+                "n_bad",
+                0
+            ) >= 2
+            and outlier.get(
+                "n_bad",
+                0
+            ) >= 2
+            and invalid_npi.get(
+                "n_bad",
+                0
+            ) >= 1
+        )
+
+        return expect(
+            ok,
+
+            (
+                f"returncode={proc.returncode}; "
+                f"zero_rate={zero_rate}; "
+                f"outlier={outlier}; "
+                f"npi={invalid_npi}"
+            )
+        )
+
+    run_test(
+        results,
+        "TC-33",
+        "Validation",
+        tc33
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    repo = find_repo()
+
+    print("=" * 78)
+    print("TiC / Cigna Standalone Thesis Evidence Rerunner")
+    print("=" * 78)
+    print()
+    print("Repository:")
+    print(repo)
+    print()
+    print("API server is NOT required.")
+    print()
+
+    output = (
+        repo /
+        "thesis_test_evidence_cigna_rerun"
+    )
+
+    if output.exists():
+        shutil.rmtree(output)
+
+    output.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    root = Path(
+        tempfile.mkdtemp(
+            prefix="tic_failed_tests_",
+            dir=str(output)
+        )
+    )
+
+    results = []
+
+    try:
+
+        plain, second = create_fixtures(
+            root
+        )
+
+        # ----------------------------------------------------
+        # TC-10
+        # ----------------------------------------------------
+
+        run_test(
+            results,
+            "TC-10",
+            "Ingestion",
+            lambda: tc10(
+                root,
+                repo,
+                plain,
+                second
+            )
+        )
+
+        # ----------------------------------------------------
+        # TC-19 / TC-20 / TC-21
+        # ----------------------------------------------------
+
+        acquisition_tests(
+            results,
+            root,
+            repo
+        )
+
+        # ----------------------------------------------------
+        # TC-23 / TC-27
+        # ----------------------------------------------------
+
+        benchmark_tests(
+            results,
+            root,
+            repo
+        )
+
+        # ----------------------------------------------------
+        # TC-29 through TC-33
+        # ----------------------------------------------------
+
+        validation_tests(
+            results,
+            root,
+            repo,
+            plain
+        )
+
+        # ----------------------------------------------------
+        # REPORT
+        # ----------------------------------------------------
+
+        report = {
+            "repository": str(repo),
+            "generated": time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "tests": [
+                asdict(r)
                 for r in results
-            )
-            for k in (
-                "PASS",
-                "FAIL"
-            )
-        }
-
-        payload = {
-            "generated_utc":
-                time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ",
-                    time.gmtime()
-                ),
-
-            "api_used": False,
-
-            "results":
-                [
-                    asdict(r)
+            ],
+            "summary": {
+                "PASS": sum(
+                    r.status == "PASS"
                     for r in results
-                ],
-
-            "summary":
-                summary
+                ),
+                "FAIL": sum(
+                    r.status == "FAIL"
+                    for r in results
+                ),
+                "TOTAL": len(results)
+            }
         }
 
-        (
-            outdir /
-            "targeted_results.json"
-        ).write_text(
+        (output / "rerun_results.json").write_text(
             json.dumps(
-                payload,
+                report,
                 indent=2,
                 default=str
             ),
             encoding="utf-8"
         )
 
-        lines = [
-            "# TiC / Cigna Targeted Thesis Rerun",
-            "",
-            (
-                f"PASS: **{summary['PASS']}** | "
-                f"FAIL: **{summary['FAIL']}** | "
-                f"TOTAL: **{len(results)}**"
-            ),
-            "",
-            "| Case | Status | Actual result | Note |",
-            "|---|---|---|---|"
-        ]
+        lines = []
+
+        lines.append(
+            "# Cigna Failed-Test Rerun"
+        )
+
+        lines.append("")
+        lines.append(
+            f"Repository: `{repo}`"
+        )
+
+        lines.append("")
+        lines.append(
+            "| Case | Area | Status | Actual | Time (ms) |"
+        )
+
+        lines.append(
+            "|---|---|---|---|---:|"
+        )
 
         for r in results:
 
@@ -2089,64 +2293,123 @@ def main() -> int:
                 .replace("\n", " ")
             )
 
-            note = (
-                r.note
-                .replace("|", "\\|")
-                .replace("\n", " ")
-            )
-
             lines.append(
-                f"| {r.case} | **{r.status}** | "
-                f"{actual} | {note} |"
+                f"| {r.case} | "
+                f"{r.area} | "
+                f"**{r.status}** | "
+                f"{actual} | "
+                f"{r.elapsed_ms:.2f} |"
             )
 
-        (
-            outdir /
-            "targeted_results.md"
-        ).write_text(
-            "\n".join(lines) + "\n",
+        lines.append("")
+        lines.append(
+            "## Summary"
+        )
+
+        lines.append("")
+
+        lines.append(
+            f"PASS: **{report['summary']['PASS']}**  "
+            f"FAIL: **{report['summary']['FAIL']}**  "
+            f"TOTAL: **{report['summary']['TOTAL']}**"
+        )
+
+        lines.append("")
+        lines.append(
+            "These results were generated by executing the "
+            "repository implementation. No PASS status is "
+            "manufactured for a failed assertion."
+        )
+
+        (output / "rerun_results.md").write_text(
+            "\n".join(lines),
             encoding="utf-8"
         )
 
+        # ----------------------------------------------------
+        # TERMINAL OUTPUT
+        # ----------------------------------------------------
+
         print()
-        print(
-            f"PASS={summary['PASS']} | "
-            f"FAIL={summary['FAIL']} | "
-            f"TOTAL={len(results)}"
-        )
+        print("=" * 78)
+        print("RESULTS")
+        print("=" * 78)
 
         for r in results:
+
             print(
-                f"{r.case}: {r.status} :: "
+                f"{r.case:<6} "
+                f"{r.status:<6} "
                 f"{r.actual[:220]}"
             )
 
         print()
+        print("=" * 78)
 
         print(
-            f"Report: "
-            f"{outdir / 'targeted_results.md'}"
+            f"PASS  = {report['summary']['PASS']}"
         )
 
         print(
-            "No benchmark API was contacted by this script."
+            f"FAIL  = {report['summary']['FAIL']}"
         )
+
+        print(
+            f"TOTAL = {report['summary']['TOTAL']}"
+        )
+
+        print("=" * 78)
+
+        print()
+        print(
+            f"Evidence written to:"
+        )
+
+        print(output)
+
+        print()
+        print(
+            "Files:"
+        )
+
+        print(
+            output /
+            "rerun_results.md"
+        )
+
+        print(
+            output /
+            "rerun_results.json"
+        )
+
+        print()
 
         return (
             0
-            if summary["FAIL"] == 0
+            if report["summary"]["FAIL"] == 0
             else 1
         )
 
-    except Exception as e:
+    except Exception as exc:
 
+        print()
+        print("=" * 78)
+        print("RUNNER ERROR")
+        print("=" * 78)
         print(
-            f"BLOCKED: {type(e).__name__}: {e}"
+            f"{type(exc).__name__}: {exc}"
+        )
+        print()
+        traceback.print_exc()
+        print()
+        print(
+            f"Output directory: {output}"
         )
 
         return 2
 
     finally:
+
         shutil.rmtree(
             root,
             ignore_errors=True
