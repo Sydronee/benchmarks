@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-SCRIPT_VERSION = "1.0"
+SCRIPT_VERSION = "1.1"
 
 
 @dataclass
@@ -170,7 +170,7 @@ def synthetic_mrf(plan_id: str = "SYNTH-01", source_variant: str = "one") -> dic
         "provider_references": [
             {
                 "provider_group_id": 101,
-                "network_name": "Synthetic Network",
+                "network_name": ["Synthetic Network"],
                 "provider_groups": [
                     {
                         "npi": [NPI_ORG, NPI_INDIV],
@@ -181,7 +181,7 @@ def synthetic_mrf(plan_id: str = "SYNTH-01", source_variant: str = "one") -> dic
             },
             {
                 "provider_group_id": 102,
-                "network_name": "Synthetic Network 2",
+                "network_name": ["Synthetic Network 2"],
                 "provider_groups": [
                     {
                         "npi": [NPI_ORG_2],
