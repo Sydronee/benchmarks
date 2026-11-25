@@ -80,17 +80,6 @@ python load_nppes.py --nppes /path/to/npidata_pfile.csv --transparency-db transp
 python load_zip_county.py --enrichment-db ../Benchmarks/enrichment.duckdb
 ```
 
-## Refresh code descriptions
-
-Obtain the CMS reference files separately. The MS-DRG, RVU, and ICD-10-PCS
-inputs are required; the HCPCS Level II workbook is optional. Run from `TiC/`:
-
-```bash
-python load_code_descriptions.py --msdrg /path/to/appendix_A.txt --rvu /path/to/PPRRVU2026_Jan_QPP.csv --icd /path/to/icd10pcs_tables_2027.xml --hcpcs /path/to/HCPC2026_ANWEB.xlsx --enrichment-db ../Benchmarks/enrichment.duckdb
-```
-
-Omit `--hcpcs` if that workbook is unavailable.
-
 ## Build benchmarks
 
 Run after ingestion or enrichment changes. A full build materializes the
